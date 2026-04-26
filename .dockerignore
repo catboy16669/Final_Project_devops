@@ -1,0 +1,7 @@
+.git
+.gitignore
+Jenkinsfile
+terraform/
+*.md
+*.log
+.env
