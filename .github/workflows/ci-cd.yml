@@ -1,0 +1,335 @@
+name: AUPP LMS – CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+# ══════════════════════════════════════════════════════════════════
+  sonarqube-scan:
+# ══════════════════════════════════════════════════════════════════
+    name: "2 ► SonarQube — Code Quality Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for SonarQube blame data
+
+      - name: "🔍 Run SonarQube Scan"
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: "🚦 SonarQube Quality Gate Check"
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+# ══════════════════════════════════════════════════════════════════
+  trivy-source-scan:
+# ══════════════════════════════════════════════════════════════════
+    name: "3 ► Trivy — Source Code Scan"
+    runs-on: ubuntu-latest
+    needs: sonarqube-scan
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "🛡️ Trivy — Scan filesystem for vulnerabilities"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          severity: "CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+          format: "table"
+          skip-dirs: "assets/vendor"
+          output: "trivy-source-report.txt"
+
+      - name: "📄 Upload Trivy source report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-source-report
+          path: trivy-source-report.txt
+
+
+# ══════════════════════════════════════════════════════════════════
+  docker-build-scan-push:
+# ══════════════════════════════════════════════════════════════════
+    name: "4–6 ► Docker — Build, Scan & Push"
+    runs-on: ubuntu-latest
+    needs: trivy-source-scan
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "🐳 Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "🔑 Login to DockerHub"
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: "🏷️ Generate image metadata"
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/aupp-lms-website
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ github.run_number }}
+
+      - name: "🐳 Build Docker image"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false          # build only first — scan before pushing
+          load: true           # load into local Docker daemon for Trivy scan
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "🛡️ Trivy — Scan Docker image"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "image"
+          image-ref: "${{ secrets.DOCKERHUB_USERNAME }}/aupp-lms-website:${{ github.run_number }}"
+          severity: "CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+          format: "table"
+          output: "trivy-image-report.txt"
+
+      - name: "📄 Upload Trivy image report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.txt
+
+      - name: "📤 Push Docker image to DockerHub"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+# ══════════════════════════════════════════════════════════════════
+  terraform-provision:
+# ══════════════════════════════════════════════════════════════════
+    name: "7 ► Terraform — Provision EC2"
+    runs-on: ubuntu-latest
+    needs: docker-build-scan-push
+    outputs:
+      ec2-ip: ${{ steps.tf-output.outputs.ec2_ip }}
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+          terraform_wrapper: false
+
+      - name: "☁️ Terraform Init"
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-southeast-1
+        run: terraform init
+
+      - name: "📋 Terraform Plan"
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-southeast-1
+        run: terraform plan -out=tfplan
+
+      - name: "🚀 Terraform Apply"
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-southeast-1
+        run: terraform apply -auto-approve tfplan
+
+      - name: "📡 Get EC2 Public IP"
+        id: tf-output
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-southeast-1
+        run: |
+          EC2_IP=$(terraform output -raw ec2_public_ip)
+          echo "ec2_ip=${EC2_IP}" >> $GITHUB_OUTPUT
+          echo "✅ EC2 IP: ${EC2_IP}"
+
+
+# ══════════════════════════════════════════════════════════════════
+  deploy-website:
+# ══════════════════════════════════════════════════════════════════
+    name: "8 ► Deploy — Website to EC2"
+    runs-on: ubuntu-latest
+    needs: terraform-provision
+
+    steps:
+      - name: "🚀 Deploy AUPP LMS website via SSH"
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ needs.terraform-provision.outputs.ec2-ip }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          timeout:  120s
+          script: |
+            echo "=== Connected to EC2: $(hostname -I) ==="
+
+            # Wait for Docker to be ready (user_data may still be running)
+            for i in {1..10}; do
+              docker info > /dev/null 2>&1 && break
+              echo "Waiting for Docker... attempt $i"
+              sleep 10
+            done
+
+            # Pull latest image
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/aupp-lms-website:${{ github.run_number }}
+
+            # Stop and remove old containers
+            docker stop aupp-lms     2>/dev/null || true
+            docker rm   aupp-lms     2>/dev/null || true
+            docker stop nginx-exporter 2>/dev/null || true
+            docker rm   nginx-exporter 2>/dev/null || true
+
+            # Run website container
+            docker run -d \
+              --name aupp-lms \
+              --restart always \
+              -p 80:80 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/aupp-lms-website:${{ github.run_number }}
+
+            # Run nginx-prometheus-exporter (for Prometheus metrics)
+            docker run -d \
+              --name nginx-exporter \
+              --restart always \
+              --network host \
+              nginx/nginx-prometheus-exporter:latest \
+              -nginx.scrape-uri=http://localhost:80/stub_status
+
+            echo "=== Running containers ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "✅ Website deployed successfully"
+
+
+# ══════════════════════════════════════════════════════════════════
+  deploy-monitoring:
+# ══════════════════════════════════════════════════════════════════
+    name: "9 ► Deploy — Prometheus + Grafana"
+    runs-on: ubuntu-latest
+    needs: [terraform-provision, deploy-website]
+
+    steps:
+      - name: "📊 Deploy Prometheus + Grafana via SSH"
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ needs.terraform-provision.outputs.ec2-ip }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          timeout:  120s
+          script: |
+            mkdir -p /home/ubuntu/monitoring
+
+            # Write Prometheus config
+            cat > /home/ubuntu/monitoring/prometheus.yml << 'EOF'
+            global:
+              scrape_interval: 15s
+
+            scrape_configs:
+              - job_name: "aupp-lms-nginx"
+                static_configs:
+                  - targets: ["localhost:9113"]
+
+              - job_name: "node-exporter"
+                static_configs:
+                  - targets: ["localhost:9100"]
+            EOF
+
+            # Node exporter (host CPU/memory/disk metrics)
+            docker stop node-exporter 2>/dev/null || true
+            docker rm   node-exporter 2>/dev/null || true
+            docker run -d \
+              --name node-exporter \
+              --restart always \
+              --network host \
+              -v /proc:/host/proc:ro \
+              -v /sys:/host/sys:ro \
+              -v /:/rootfs:ro \
+              prom/node-exporter:latest \
+              --path.procfs=/host/proc \
+              --path.sysfs=/host/sys
+
+            # Prometheus
+            docker stop prometheus 2>/dev/null || true
+            docker rm   prometheus 2>/dev/null || true
+            docker run -d \
+              --name prometheus \
+              --restart always \
+              --network host \
+              -v /home/ubuntu/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml \
+              prom/prometheus:latest
+
+            # Grafana
+            docker stop grafana 2>/dev/null || true
+            docker rm   grafana 2>/dev/null || true
+            docker run -d \
+              --name grafana \
+              --restart always \
+              -p 3000:3000 \
+              -e GF_SECURITY_ADMIN_PASSWORD=admin123 \
+              grafana/grafana:latest
+
+            echo "=== Monitoring stack running ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+
+# ══════════════════════════════════════════════════════════════════
+  pipeline-summary:
+# ══════════════════════════════════════════════════════════════════
+    name: "✅ Pipeline Summary"
+    runs-on: ubuntu-latest
+    needs: [deploy-website, deploy-monitoring]
+
+    steps:
+      - name: "🎉 Print access URLs"
+        run: |
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║            ✅  PIPELINE SUCCEEDED                   ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  🌐 Website:    http://${{ needs.terraform-provision.outputs.ec2-ip }}          ║"
+          echo "║  📊 Prometheus: http://${{ needs.terraform-provision.outputs.ec2-ip }}:9090     ║"
+          echo "║  📈 Grafana:    http://${{ needs.terraform-provision.outputs.ec2-ip }}:3000     ║"
+          echo "║     Login: admin / admin123                          ║"
+          echo "╚══════════════════════════════════════════════════════╝"
